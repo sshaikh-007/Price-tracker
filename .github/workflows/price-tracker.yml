@@ -1,12 +1,23 @@
+# Runs tracker.py every 30 minutes on GitHub's free runners.
+# Put this folder's files at the ROOT of a new GitHub repo, then add repo
+# secrets TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID (and/or NTFY_TOPIC).
+# Free minutes: unlimited on a PUBLIC repo (secrets stay hidden; leave the
+# token fields in tracker.py empty). A PRIVATE repo gets 2,000 min/month and
+# each run bills ~2 min, so change the cron to "0 * * * *" (hourly) there.
 name: FlexiSpot price tracker
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
-  workflow_dispatch:
+    - cron: "*/30 * * * *"   # GitHub may start scheduled runs a few minutes late
+  workflow_dispatch:          # "Run workflow" button for a manual run
+    inputs:
+      test_alert:
+        description: "Only send a test Telegram/ntfy message (no price check)"
+        type: boolean
+        default: false
 
 permissions:
-  contents: write
+  contents: write             # needed to commit price_history.csv
 
 concurrency:
   group: price-tracker
@@ -14,29 +25,36 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04     # ubuntu-latest is 26.04, which Playwright 1.57 can't install Chromium on
     timeout-minutes: 10
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
 
+      - name: Send test alert
+        if: ${{ inputs.test_alert }}
+        run: python tracker.py --test-alert
+
       - name: Install dependencies
+        if: ${{ !inputs.test_alert }}
         run: |
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
       - name: Check price
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        if: ${{ !inputs.test_alert }}
         run: python tracker.py --target 380
 
       - name: Save price history
+        if: ${{ !inputs.test_alert }}
         run: |
           git config user.name "price-tracker-bot"
           git config user.email "price-tracker-bot@users.noreply.github.com"
