@@ -1,1 +1,45 @@
-pbcopy < /Users/sshaikh/Git/insights/data/flexispot_price_tracker/.github/workflows/price-tracker.yml
+name: FlexiSpot price tracker
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: price-tracker
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Check price
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python tracker.py --target 380
+
+      - name: Save price history
+        run: |
+          git config user.name "price-tracker-bot"
+          git config user.email "price-tracker-bot@users.noreply.github.com"
+          git add price_history.csv
+          git diff --cached --quiet || git commit -m "price check $(date -u +%FT%TZ)"
+          git push
