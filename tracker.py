@@ -292,6 +292,26 @@ def append_snapshot(history: Path, snap: PriceSnapshot) -> None:
         w.writerow(asdict(snap))
 
 
+# Columns that count as "something changed" when deciding whether to log a row.
+CHANGE_FIELDS = ("sale_price", "original_price", "in_stock", "promo_text", "coupons",
+                 "coupon_discount", "campaign")
+
+
+def should_log(prev: dict | None, snap: PriceSnapshot) -> tuple[bool, str]:
+    """Log a row when something changed, plus one heartbeat row per day so a quiet
+    week still shows the tracker was running. Returns (log?, reason)."""
+    if prev is None:
+        return True, "first check"
+    row = asdict(snap)
+    changed = [f for f in CHANGE_FIELDS
+               if ("" if row[f] is None else str(row[f])) != (prev.get(f) or "")]
+    if changed:
+        return True, "changed: " + ", ".join(changed)
+    if (prev.get("checked_at") or "")[:10] != snap.checked_at[:10]:
+        return True, "daily heartbeat"
+    return False, "no change, not logged"
+
+
 def describe_change(prev: dict | None, snap: PriceSnapshot) -> tuple[str, float | None]:
     """Returns (message, delta). delta < 0 means the price dropped."""
     if prev is None:
@@ -510,6 +530,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--keywords", default=DEFAULT_KEYWORDS,
                     help="comma-separated words that mark a campaign event/coupon as relevant")
     ap.add_argument("--no-notify", action="store_true", help="don't send any alerts")
+    ap.add_argument("--log-all", action="store_true",
+                    help="add a history row on every check (default: only changes + one per day)")
     ap.add_argument("--every", type=float, metavar="MINUTES",
                     help="keep running and check every N minutes (e.g. --every 30)")
     ap.add_argument("--test-alert", action="store_true",
@@ -543,7 +565,9 @@ def check_once(args) -> int:
                           keywords=args.keywords.split(","))
     prev = last_snapshot(args.history, args.url)
     change, delta = describe_change(prev, snap)
-    append_snapshot(args.history, snap)
+    log, log_reason = (True, "logging every check") if args.log_all else should_log(prev, snap)
+    if log:
+        append_snapshot(args.history, snap)
 
     orig = f" (was £{snap.original_price:.2f}, -{snap.discount_pct}%)" if snap.original_price else ""
     stock = "" if snap.in_stock is None else (" in stock" if snap.in_stock else " OUT OF STOCK")
@@ -555,6 +579,7 @@ def check_once(args) -> int:
         print(f"  coupon: {snap.coupons}{pay}", flush=True)
     else:
         print("  coupon: none shown", flush=True)
+    print(f"  history: {log_reason}", flush=True)
     if args.campaign_url:
         print("  campaign: " + (snap.campaign_detail.replace("\n", "\n            ")
                                 if snap.campaign else f"nothing matching '{args.keywords}'"), flush=True)
