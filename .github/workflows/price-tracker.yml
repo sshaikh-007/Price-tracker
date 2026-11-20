@@ -62,5 +62,6 @@ jobs:
           git config user.name "price-tracker-bot"
           git config user.email "price-tracker-bot@users.noreply.github.com"
           git add price_history.csv
+          if [ -d coupon_raw ]; then git add coupon_raw; fi
           git diff --cached --quiet || git commit -m "price check $(date -u +%FT%TZ)"
           git push
