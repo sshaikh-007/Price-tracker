@@ -8,8 +8,11 @@ name: FlexiSpot price tracker
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # GitHub may start scheduled runs a few minutes late
-  workflow_dispatch:          # "Run workflow" button for a manual run
+    # Backup only. GitHub's scheduler is best-effort and drops many runs on new or
+    # quiet repos, especially at :00/:30 when everyone's jobs fire. The reliable
+    # 30-minute trigger is cron-job.org calling workflow_dispatch (see README).
+    - cron: "7,37 * * * *"
+  workflow_dispatch:          # "Run workflow" button, and the cron-job.org trigger
     inputs:
       test_alert:
         description: "Only send a test Telegram/ntfy message (no price check)"
