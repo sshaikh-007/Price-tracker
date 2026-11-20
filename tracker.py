@@ -350,7 +350,8 @@ def notify(title: str, message: str, url: str = "") -> list[str]:
     Configure with the ALERT SETTINGS at the top of this file, or environment
     variables of the same name (env wins):
       TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID   -> Telegram bot message
-      NTFY_TOPIC (+ optional NTFY_SERVER)     -> ntfy.sh push notification
+      NTFY_TOPIC (+ optional NTFY_SERVER,     -> ntfy.sh push notification
+                  NTFY_PRIORITY=min|low|default|high|urgent, default high)
     A macOS desktop notification is also shown when running on a Mac.
     """
     import os
@@ -378,7 +379,10 @@ def notify(title: str, message: str, url: str = "") -> list[str]:
     topic = os.environ.get("NTFY_TOPIC") or NTFY_TOPIC
     if topic:
         server = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
-        headers = {"Title": title.encode("ascii", "ignore").decode(), "Tags": "moneybag"}
+        # Priority 4-5 makes the phone ring/vibrate straight away instead of a quiet
+        # badge; 5 ("urgent") also breaks through Do Not Disturb if you allow it in the app.
+        headers = {"Title": title.encode("ascii", "ignore").decode(), "Tags": "moneybag",
+                   "Priority": os.environ.get("NTFY_PRIORITY", "high")}
         if url:
             headers["Click"] = url
         try:
