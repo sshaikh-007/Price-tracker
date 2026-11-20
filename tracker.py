@@ -6,6 +6,8 @@ check. Also records product coupons (the "Discount £33"-style line under the pr
 and the coupon list the page loads). Sends Telegram / ntfy / macOS alerts on a price
 drop, when the price after coupon reaches --target, when a coupon appears / changes /
 disappears, on stock changes and on promo changes (settings at the top of this file).
+It also scans the Black Friday campaign page for sofa/recliner coupon events
+(--campaign-url, --keywords), which never appear on the product page.
 
 Usage:
     python3 tracker.py                          # one check
@@ -27,7 +29,7 @@ import json
 import re
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -41,13 +43,19 @@ NTFY_TOPIC = ""           # optional: ntfy.sh topic name, e.g. "waffle-recliner-
 # ---------------------------------------------------------------------------
 
 DEFAULT_URL = "https://flexispot.co.uk/power-swivel-rocker-recliner-with-waffle-back.html"
+# Campaign page with event-only coupons (e.g. the one-day "Sofa Flash Coupon Sale"
+# tiers) that never show on the product page. "" turns this check off.
+DEFAULT_CAMPAIGN_URL = "https://flexispot.co.uk/black-friday-2026"
+DEFAULT_KEYWORDS = "sofa,recliner,waffle"
 HERE = Path(__file__).resolve().parent
 DEFAULT_HISTORY = HERE / "price_history.csv"
+RAW_COUPON_DIR = HERE / "coupon_raw"
 DETAIL_API = "/sapi/mall-item/item/detail"
 COUPON_APIS = ("/sapi/mall-marketing/coupon/querySkuCoupon",
                "/sapi/mall-marketing/coupon/queryCouponDiscountFunc")
 FIELDS = ["checked_at", "url", "name", "sale_price", "original_price", "discount_pct",
-          "in_stock", "promo_text", "source", "coupons", "coupon_discount", "effective_price"]
+          "in_stock", "promo_text", "source", "coupons", "coupon_discount", "effective_price",
+          "campaign"]
 
 
 @dataclass
@@ -64,6 +72,66 @@ class PriceSnapshot:
     coupons: str = ""                      # readable summary; "" = no coupon on the page
     coupon_discount: float | None = None   # £ off from the coupon, when the page states it
     effective_price: float | None = None   # sale price minus coupon discount
+    campaign: str = ""                     # matching events/coupon tiers on the campaign page
+    # not saved to the CSV:
+    campaign_detail: str = field(default="", repr=False)        # with quantities left
+    raw_coupon_json: list = field(default_factory=list, repr=False)
+
+
+# ---------- campaign page (Black Friday coupon events) ----------
+
+_DATE_RANGE = re.compile(r"^\d{1,2}\.[A-Z][a-z]{2}( \d{1,2}:\d{2})? - \d{1,2}\.[A-Z][a-z]{2}( \d{1,2}:\d{2})?$")
+_SECTION_WORDS = re.compile(r"coupon|sale|deal|discount|offer|code", re.I)
+_TIER = re.compile(r"-\s*(£\s*\d+(?:\.\d+)?|\d+(?:\.\d+)?\s*%)\s*Q(?:ty|uantity):?\s*(?:Only)?\s*(\d+)\s*(\d+)\s*%\s*Left", re.I)
+
+
+def parse_campaign_text(text: str, keywords: list[str]) -> tuple[list[str], list[str], list[str]]:
+    """From the campaign page's visible text, return:
+    events   - timeline entries whose title mentions a keyword, e.g.
+               "Sofa Tiered Coupon Sale (19.Nov 10:00 - 19.Nov 23:59)"
+    sections - stable summary of matching coupon blocks, e.g.
+               "Sofa Flash Coupon Sale: -50%, -30%, -10%, -8%"
+    details  - the same blocks with how many coupons are left (changes all day,
+               so it's shown in alerts but never used to decide whether to alert)
+    """
+    kws = [k.strip().lower() for k in keywords if k.strip()]
+    lines = [" ".join(l.split()) for l in (text or "").splitlines()]
+    lines = [l for l in lines if l]
+    hit = lambda l: any(k in l.lower() for k in kws)
+
+    events, timeline_titles = [], set()
+    for i, l in enumerate(lines[:-1]):
+        if _DATE_RANGE.match(l):
+            timeline_titles.add(i + 1)
+            if hit(lines[i + 1]):
+                ev = f"{lines[i + 1]} ({l})"
+                if ev not in events:
+                    events.append(ev)
+
+    sections, details, seen = [], [], set()
+    for i, l in enumerate(lines):
+        if i in timeline_titles or l in seen or len(l) > 80:
+            continue
+        if not (hit(l) and _SECTION_WORDS.search(l)):
+            continue
+        seen.add(l)
+        window = lines[i + 1:i + 60]
+        sub = next((w for w in window[:3] if w != l and len(w) > 20 and not _CLOCK.search(w)), "")
+        tiers = _TIER.findall(" ".join(window))
+        if not tiers and not sub:
+            continue
+        offs = [t[0].replace(" ", "") for t in tiers]
+        sections.append(f"{l}: " + (", ".join("-" + o for o in offs) if offs else sub))
+        left = ", ".join(f"-{t[0].replace(' ', '')} ({t[1]} coupons, {t[2]}% left)" for t in tiers)
+        details.append(f"{l}" + (f" - {sub}" if sub else "") + (f": {left}" if left else ""))
+    return events, sections, details
+
+
+def apply_campaign(snap: "PriceSnapshot", text: str, keywords: list[str]) -> "PriceSnapshot":
+    events, sections, details = parse_campaign_text(text, keywords)
+    snap.campaign = " | ".join(sections + [f"event: {e}" for e in events])
+    snap.campaign_detail = "\n".join(details + [f"event: {e}" for e in events])
+    return snap
 
 
 # Coupon JSON fields worth keeping (names vary by promotion type) and fields that
@@ -136,6 +204,7 @@ def apply_coupons(snap: "PriceSnapshot", api_payloads: list[dict], dom_texts: li
     disc = clean_dom_coupon_texts(discount_texts or [])
     dom = [t for t in clean_dom_coupon_texts(dom_texts) if t not in disc]
     api = summarize_coupon_json(api_payloads)
+    snap.raw_coupon_json = [p for p in api_payloads if (p or {}).get("data")]
     snap.coupons = " | ".join(disc + dom + api)
     snap.coupon_discount = coupon_discount_from_text(disc, snap.sale_price)
     if snap.sale_price is not None:
@@ -217,7 +286,7 @@ def append_snapshot(history: Path, snap: PriceSnapshot) -> None:
                 w.writeheader()
                 w.writerows(rows)
     with history.open("a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=FIELDS)
+        w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
         if new:
             w.writeheader()
         w.writerow(asdict(snap))
@@ -247,6 +316,10 @@ def alerts_for(prev: dict | None, snap: PriceSnapshot, delta: float | None,
         reasons.append(f"{'Coupon changed' if prev_coupons else 'Coupon available'}: {snap.coupons}{pay}")
     elif prev is not None and prev_coupons and not snap.coupons:
         reasons.append("Coupon no longer shown")
+    # campaign page: a new or changed sofa/recliner coupon event
+    prev_campaign = (prev or {}).get("campaign") or ""
+    if snap.campaign and snap.campaign != prev_campaign:
+        reasons.append("Black Friday page: " + (snap.campaign_detail or snap.campaign).replace("\n", "\n  "))
     # target is checked against the price after any coupon
     now_price = snap.effective_price if snap.effective_price is not None else snap.sale_price
     if target is not None and now_price is not None and now_price <= target:
@@ -322,7 +395,8 @@ def notify(title: str, message: str, url: str = "") -> list[str]:
 
 # ---------- fetching ----------
 
-def fetch_snapshot(url: str, timeout_ms: int = 45000) -> PriceSnapshot:
+def fetch_snapshot(url: str, timeout_ms: int = 45000, campaign_url: str = "",
+                   keywords: list[str] | None = None) -> PriceSnapshot:
     from playwright.sync_api import sync_playwright
 
     now = datetime.now().isoformat(timespec="seconds")
@@ -354,12 +428,7 @@ def fetch_snapshot(url: str, timeout_ms: int = 45000) -> PriceSnapshot:
         except Exception:
             return [], []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(locale="en-GB", user_agent=(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"))
-        page.on("response", on_response)
+    def read_product(page) -> PriceSnapshot:
         # Preferred source: the product JSON the page requests after load.
         try:
             with page.expect_response(is_detail, timeout=timeout_ms) as resp_info:
@@ -367,7 +436,6 @@ def fetch_snapshot(url: str, timeout_ms: int = 45000) -> PriceSnapshot:
             snap = parse_detail_json(resp_info.value.json(), url, now)
             if snap and snap.sale_price:
                 dom_texts, discount_texts = read_coupons(page)
-                browser.close()
                 return apply_coupons(snap, coupon_payloads, dom_texts, discount_texts)
         except Exception as e:  # fall back to the rendered price
             print(f"  (product JSON not available: {e.__class__.__name__}; reading page instead)",
@@ -384,12 +452,47 @@ def fetch_snapshot(url: str, timeout_ms: int = 45000) -> PriceSnapshot:
         orig_text = orig_loc.first.inner_text(timeout=2000) if orig_loc.count() else ""
         name = (page.title() or "").split("|")[0].strip()
         dom_texts, discount_texts = read_coupons(page)
-        browser.close()
+        snap = parse_dom_prices(sale_text, orig_text, name, url, now)
+        if snap is None:
+            raise RuntimeError(f"Could not find a price on {url}")
+        return apply_coupons(snap, coupon_payloads, dom_texts, discount_texts)
 
-    snap = parse_dom_prices(sale_text, orig_text, name, url, now)
-    if snap is None:
-        raise RuntimeError(f"Could not find a price on {url}")
-    return apply_coupons(snap, coupon_payloads, dom_texts, discount_texts)
+    def read_campaign(page, snap: PriceSnapshot) -> None:
+        """Best effort: the campaign page may be gone after the event, which is fine."""
+        try:
+            resp = page.goto(campaign_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            if resp is not None and resp.status >= 400:
+                print(f"  (campaign page returned {resp.status}; skipped)", file=sys.stderr)
+                return
+            page.wait_for_timeout(6000)  # sections render from several API calls
+            apply_campaign(snap, page.inner_text("body"), keywords or [])
+        except Exception as e:
+            print(f"  (campaign page check failed: {e.__class__.__name__}; skipped)", file=sys.stderr)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(locale="en-GB", user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"))
+        page.on("response", on_response)
+        try:
+            snap = read_product(page)
+            if campaign_url:
+                read_campaign(page, snap)
+        finally:
+            browser.close()
+    return snap
+
+
+def save_raw_coupons(snap: PriceSnapshot, folder: Path = RAW_COUPON_DIR) -> Path | None:
+    """Keep the coupon API's raw JSON the first time a coupon appears or changes,
+    so the alert wording can be improved from real data later."""
+    if not snap.raw_coupon_json:
+        return None
+    folder.mkdir(parents=True, exist_ok=True)
+    out = folder / f"{snap.checked_at.replace(':', '-')}.json"
+    out.write_text(json.dumps(snap.raw_coupon_json, indent=2, ensure_ascii=False))
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -398,6 +501,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--history", type=Path, default=DEFAULT_HISTORY)
     ap.add_argument("--target", type=float,
                     help="notify when the price after any coupon is at or below this (GBP)")
+    ap.add_argument("--campaign-url", default=DEFAULT_CAMPAIGN_URL,
+                    help='campaign page to scan for event coupons ("" to skip)')
+    ap.add_argument("--keywords", default=DEFAULT_KEYWORDS,
+                    help="comma-separated words that mark a campaign event/coupon as relevant")
     ap.add_argument("--no-notify", action="store_true", help="don't send any alerts")
     ap.add_argument("--every", type=float, metavar="MINUTES",
                     help="keep running and check every N minutes (e.g. --every 30)")
@@ -428,7 +535,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def check_once(args) -> int:
-    snap = fetch_snapshot(args.url)
+    snap = fetch_snapshot(args.url, campaign_url=args.campaign_url,
+                          keywords=args.keywords.split(","))
     prev = last_snapshot(args.history, args.url)
     change, delta = describe_change(prev, snap)
     append_snapshot(args.history, snap)
@@ -443,8 +551,16 @@ def check_once(args) -> int:
         print(f"  coupon: {snap.coupons}{pay}", flush=True)
     else:
         print("  coupon: none shown", flush=True)
+    if args.campaign_url:
+        print("  campaign: " + (snap.campaign_detail.replace("\n", "\n            ")
+                                if snap.campaign else f"nothing matching '{args.keywords}'"), flush=True)
 
     reasons = alerts_for(prev, snap, delta, args.target)
+    if snap.raw_coupon_json and snap.coupons != ((prev or {}).get("coupons") or ""):
+        raw = json.dumps(snap.raw_coupon_json, ensure_ascii=False)
+        print(f"  raw coupon data: {raw[:4000]}", flush=True)
+        saved = save_raw_coupons(snap)
+        print(f"  raw coupon data saved to {saved.relative_to(HERE) if saved else '-'}", flush=True)
     if reasons and not args.no_notify:
         sent = notify("FlexiSpot: " + reasons[0], "\n".join([snap.name, *reasons]), snap.url)
         print(f"  alert sent via: {', '.join(sent) or 'nothing configured'}", flush=True)
