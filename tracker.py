@@ -239,6 +239,8 @@ def parse_detail_json(payload: dict, url: str, now: str) -> PriceSnapshot | None
     orig = (sku.get("originalPrc") or {}).get("value")
     sale = round(float(sale), 2) if sale is not None else None
     orig = round(float(orig), 2) if orig is not None else None
+    if not sale or sale <= 0:  # page still loading / placeholder: not a real price
+        return None
     item = data.get("itemRenderTO") or {}
     promo = item.get("secKillFormalDescription") or "" if item.get("secKillFlag") else ""
     return PriceSnapshot(
@@ -253,7 +255,7 @@ def parse_detail_json(payload: dict, url: str, now: str) -> PriceSnapshot | None
 def parse_dom_prices(sale_text: str, original_text: str, name: str, url: str,
                      now: str) -> PriceSnapshot | None:
     sale, orig = parse_money(sale_text), parse_money(original_text)
-    if sale is None:
+    if not sale or sale <= 0:  # "£0.00" is the placeholder shown before the price loads
         return None
     return PriceSnapshot(checked_at=now, url=url, name=name, sale_price=sale,
                          original_price=orig, discount_pct=discount_pct(sale, orig),
@@ -453,17 +455,22 @@ def fetch_snapshot(url: str, timeout_ms: int = 45000, campaign_url: str = "",
             return [], []
 
     def read_product(page) -> PriceSnapshot:
-        # Preferred source: the product JSON the page requests after load.
-        try:
-            with page.expect_response(is_detail, timeout=timeout_ms) as resp_info:
-                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            snap = parse_detail_json(resp_info.value.json(), url, now)
-            if snap and snap.sale_price:
-                dom_texts, discount_texts = read_coupons(page)
-                return apply_coupons(snap, coupon_payloads, dom_texts, discount_texts)
-        except Exception as e:  # fall back to the rendered price
-            print(f"  (product JSON not available: {e.__class__.__name__}; reading page instead)",
-                  file=sys.stderr)
+        # Preferred source: the product JSON the page requests after load. It's
+        # occasionally slow or missing, so reload and try again before falling back.
+        for attempt in range(1, 4):
+            try:
+                coupon_payloads.clear()
+                with page.expect_response(is_detail, timeout=timeout_ms // 2) as resp_info:
+                    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                snap = parse_detail_json(resp_info.value.json(), url, now)
+                if snap:
+                    dom_texts, discount_texts = read_coupons(page)
+                    return apply_coupons(snap, coupon_payloads, dom_texts, discount_texts)
+                why = "no valid price in it"
+            except Exception as e:
+                why = e.__class__.__name__
+            print(f"  (product JSON attempt {attempt}/3 failed: {why})", file=sys.stderr)
+        print("  (reading the price from the page instead)", file=sys.stderr)
         try:
             page.wait_for_function(
                 "() => { const e = document.querySelector('.price-container');"
@@ -560,10 +567,35 @@ def main(argv: list[str] | None = None) -> int:
         time.sleep(args.every * 60 + random.uniform(0, 60))
 
 
+def fill_from_previous(snap: PriceSnapshot, prev: dict | None) -> PriceSnapshot:
+    """A page-read (fallback) snapshot can't see the promo banner or stock status.
+    Keep the last known values so they don't look like they vanished and came back."""
+    if snap.source == "dom" and prev:
+        if not snap.promo_text:
+            snap.promo_text = prev.get("promo_text") or ""
+        if snap.in_stock is None and prev.get("in_stock") in ("True", "False"):
+            snap.in_stock = prev["in_stock"] == "True"
+    return snap
+
+
+def is_suspicious_drop(prev: dict | None, snap: PriceSnapshot) -> bool:
+    """A fall of more than half in one check is far more likely a bad read than a real deal."""
+    try:
+        return bool(prev) and snap.sale_price < 0.5 * float(prev["sale_price"])
+    except (TypeError, ValueError, KeyError):
+        return False
+
+
 def check_once(args) -> int:
-    snap = fetch_snapshot(args.url, campaign_url=args.campaign_url,
-                          keywords=args.keywords.split(","))
+    fetch = lambda: fetch_snapshot(args.url, campaign_url=args.campaign_url,
+                                   keywords=args.keywords.split(","))
+    snap = fetch()
     prev = last_snapshot(args.history, args.url)
+    if is_suspicious_drop(prev, snap):
+        print(f"  (price read as £{snap.sale_price:.2f}, under half the last £{prev['sale_price']}; "
+              "checking again)", file=sys.stderr, flush=True)
+        snap = fetch()  # a genuine price cut shows up again; a glitch usually doesn't
+    snap = fill_from_previous(snap, prev)
     change, delta = describe_change(prev, snap)
     log, log_reason = (True, "logging every check") if args.log_all else should_log(prev, snap)
     if log:
