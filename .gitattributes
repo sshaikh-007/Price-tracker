@@ -1,0 +1,2 @@
+# Two runs appending rows at once: keep both sides' rows instead of a merge conflict.
+price_history.csv merge=union
