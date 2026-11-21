@@ -52,6 +52,7 @@ DEFAULT_HISTORY = HERE / "price_history.csv"
 RAW_COUPON_DIR = HERE / "coupon_raw"
 DETAIL_API = "/sapi/mall-item/item/detail"
 COUPON_APIS = ("/sapi/mall-marketing/coupon/querySkuCoupon",
+               "/sapi/mall-marketing/couponWordingApp/matchBySku",
                "/sapi/mall-marketing/coupon/queryCouponDiscountFunc")
 FIELDS = ["checked_at", "url", "name", "sale_price", "original_price", "discount_pct",
           "in_stock", "promo_text", "source", "coupons", "coupon_discount", "effective_price",
@@ -143,9 +144,69 @@ _COUPON_SKIP = re.compile(r"current|remain|stock|received|trace|image|icon|url|"
 _CLOCK = re.compile(r"\d{1,2}\s*:\s*\d{2}")
 
 
+def _uk_time(ms) -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.fromtimestamp(int(ms) / 1000, ZoneInfo("Europe/London")).strftime("%d %b %H:%M")
+    except Exception:
+        return ""
+
+
+def _coupon_items(payloads: list[dict]) -> list[dict]:
+    items = []
+    for payload in payloads:
+        data = (payload or {}).get("data")
+        items += data if isinstance(data, list) else ([data] if isinstance(data, dict) and data else [])
+    return [i for i in items if isinstance(i, dict)]
+
+
+def summarize_wording(item: dict) -> str:
+    """The "Get £xx off" banner (couponWordingApp/matchBySku), seen on the E7 Pro page
+    2026-11-21: stage PRE = "Coming Soon" text, DURING = "Now Live" text + claim button."""
+    stage = (item.get("currentStage") or "").upper()
+    text = item.get("duringActivityText") if stage == "DURING" else item.get("preActivityText")
+    text = text or item.get("duringActivityText") or item.get("preActivityText") or ""
+    label = {"PRE": "COMING SOON", "DURING": "LIVE"}.get(stage, stage or "coupon")
+    out = f"{label}: {text}"
+    if stage == "DURING" and item.get("randomCodeClaimText"):
+        out += f" [{item['randomCodeClaimText']}]"
+    if item.get("countdownEnd"):
+        out += f" until {_uk_time(item['countdownEnd'])}"
+    return out
+
+
+def summarize_discount(item: dict) -> str:
+    """queryCouponDiscountFunc: {"discountType": "FIXED_AMOUNT_DISCOUNT", "discountAmt": 180, "minPurchase": 1}"""
+    kind, amt = (item.get("discountType") or "").upper(), item.get("discountAmt")
+    if amt is None:
+        return ""
+    off = f"{amt:g}% off" if "PERCENT" in kind or "RATE" in kind else f"£{amt:g} off"
+    return f"coupon {off}"
+
+
+def api_coupon_discount(payloads: list[dict], sale: float | None) -> float | None:
+    for item in _coupon_items(payloads):
+        if "discountType" in item and item.get("discountAmt") is not None:
+            amt, kind = float(item["discountAmt"]), (item.get("discountType") or "").upper()
+            if "PERCENT" in kind or "RATE" in kind:
+                return round(sale * amt / 100, 2) if sale and amt <= 100 else None
+            return round(amt, 2)
+    return None
+
+
 def summarize_coupon_json(payloads: list[dict]) -> list[str]:
     """Readable, stable one-line summaries of the coupons in the coupon API responses."""
     out = []
+    for item in _coupon_items(payloads):
+        if "hasWording" in item:  # banner API: nothing to show unless hasWording
+            if item.get("hasWording"):
+                out.append(summarize_wording(item))
+        elif "discountType" in item:
+            line = summarize_discount(item)
+            if line:
+                out.append(line)
+    payloads = [{"data": [i for i in _coupon_items(payloads)
+                          if "hasWording" not in i and "discountType" not in i]}]
 
     def flat(obj, prefix=""):
         if isinstance(obj, dict) and "value" in obj and set(obj) <= {"type", "value", "currency"}:
@@ -204,9 +265,12 @@ def apply_coupons(snap: "PriceSnapshot", api_payloads: list[dict], dom_texts: li
     disc = clean_dom_coupon_texts(discount_texts or [])
     dom = [t for t in clean_dom_coupon_texts(dom_texts) if t not in disc]
     api = summarize_coupon_json(api_payloads)
-    snap.raw_coupon_json = [p for p in api_payloads if (p or {}).get("data")]
-    snap.coupons = " | ".join(disc + dom + api)
-    snap.coupon_discount = coupon_discount_from_text(disc, snap.sale_price)
+    snap.raw_coupon_json = [p for p in api_payloads
+                            if (p or {}).get("data") and summarize_coupon_json([p])]
+    # Prefer the coupon data; page wording is a fallback (it renders late and would flap).
+    snap.coupons = " | ".join(api) if api else " | ".join(disc + dom)
+    snap.coupon_discount = (api_coupon_discount(api_payloads, snap.sale_price)
+                            or coupon_discount_from_text(disc, snap.sale_price))
     if snap.sale_price is not None:
         snap.effective_price = round(snap.sale_price - (snap.coupon_discount or 0), 2)
     return snap
@@ -441,11 +505,16 @@ def fetch_snapshot(url: str, timeout_ms: int = 45000, campaign_url: str = "",
 
     def read_coupons(page) -> tuple[list[str], list[str]]:
         """Coupon JSON arrives after the price; give it a few seconds, then read the page."""
-        try:
-            page.wait_for_response(lambda r: COUPON_APIS[0] in r.url, timeout=10000)
-        except Exception:
-            pass
-        page.wait_for_timeout(2500)  # discount call + render
+        # Wait (up to ~12 s) until the banner API has answered and, if it shows a
+        # coupon, the discount amount has arrived too; then let the page render.
+        for _ in range(48):
+            items = _coupon_items(coupon_payloads)
+            banner = [i for i in items if "hasWording" in i]
+            needs_amount = any(i.get("hasWording") for i in banner)
+            if banner and (not needs_amount or any("discountType" in i for i in items)):
+                break
+            page.wait_for_timeout(250)
+        page.wait_for_timeout(1500)
         visible = "els => els.filter(e => e.offsetParent !== null && e.children.length < 6).map(e => e.innerText)"
         try:
             discount = page.eval_on_selector_all(".discount-price", visible)
