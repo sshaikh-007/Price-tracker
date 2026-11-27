@@ -1,0 +1,44 @@
+[
+  {
+    "code": 200,
+    "msg": "ok",
+    "traceId": "855c2b9ac175148ff27c864e384cc309",
+    "data": [
+      {
+        "skuSourceId": 1784025,
+        "hasWording": true,
+        "wordingId": 413,
+        "wordingName": "FSBL10 全场10%off",
+        "couponType": "PUBLIC",
+        "couponCode": "FSBL10",
+        "couponId": 7359197,
+        "preDisplayCodeName": "Code:",
+        "duringDisplayCodeName": "Code:",
+        "preDisplayCouponCode": "FSBL10",
+        "duringDisplayCouponCode": "FSBL10",
+        "duringDisplayCouponDesc": "10% Off",
+        "preActivityText": "10% Off Sitewide – Coming soon!",
+        "duringActivityText": "10% Off Sitewide Now live - Shop Now !",
+        "showCountdown": 1,
+        "countdownEnd": 1796083199000,
+        "currentStage": "DURING",
+        "priority": 6
+      }
+    ],
+    "result": true
+  },
+  {
+    "code": 200,
+    "msg": "ok",
+    "traceId": "d10489e86f60d9027b7dd3aaa814e793",
+    "data": {
+      "minPurchase": 1.0,
+      "discountType": "PERCENTAGE_DISCOUNT",
+      "discountAmt": 9.0,
+      "couponCode": "FSBL10",
+      "couponPurchaseType": "AMOUNT",
+      "useMode": "SINGLE"
+    },
+    "result": true
+  }
+]
